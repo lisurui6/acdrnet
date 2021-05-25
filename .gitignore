@@ -1,0 +1,6 @@
+.idea/
+*.png
+*.tif
+run/
+*.pyc
+__pycache__/
