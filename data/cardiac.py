@@ -55,7 +55,7 @@ class CardiacDataset(Dataset):
 
         dmap = signed_distance(mask)  # (3, W, H)
         g_maps = []
-        for i in range(2):
+        for i in range(3):
             g_x, g_y = np.gradient(dmap[i, :, :])
             g_x = np.multiply(dmap[i, :, :] / 128, -g_x)
             g_y = np.multiply(dmap[i, :, :] / 128, -g_y)
@@ -99,7 +99,6 @@ def signed_distance(mask):
     dist_func = ndimage.distance_transform_edt
     distance = np.where(f, dist_func(f) - 0.5, -(dist_func(1-f) - 0.5))
     distances.append(distance)
-
     distances = np.stack(distances)
 
     return distances

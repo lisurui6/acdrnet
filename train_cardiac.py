@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 
 from models.networks.cardiac import CardaicCircleNet, CardiacUNet
+from models.networks.deform import DeformCardiacCircleNet
+
 from data.cityscapes_instances import CityscapesInstances, CityscapesInstances_comp
 from data.buildings import BuildingsDataset
 from data.cardiac import CardiacDataset
@@ -25,21 +27,27 @@ def visualise_images(image, mask, pred_masks, affine_masks, disp, g_map, global_
     grid_image = make_grid(image[:10, :, :, :].clone().cpu().data, 10, normalize=True, scale_each=True)
     summary.writer.add_image(f'{prefix}_image/image', grid_image, global_step)
     displace_mask = torch.zeros_like(mask[:10, :, :, :])
+    mask[:, 1, :, :][mask[:, 0, :, :] > 0.5] = 0
+    displace_mask[:, 0, :, :][mask[:10, 0, :, :] > 0.5] = 1
     displace_mask[:, 1, :, :][mask[:10, 1, :, :] > 0.5] = 1
     displace_mask[:, 2, :, :][mask[:10, 2, :, :] > 0.5] = 1
     grid_image = make_grid(displace_mask.clone().cpu().data, 10, normalize=True, scale_each=True)
     summary.writer.add_image(f'{prefix}_mask/mask', grid_image, global_step)
 
+    pred_masks[1][pred_masks[0] > 0.5] = 0
     displace_mask = torch.zeros_like(mask[:10, :, :, :])
-    displace_mask[:, 1:2, :, :][pred_masks[0][:10] > 0.5] = 1
-    displace_mask[:, 2:3, :, :][pred_masks[1][:10] > 0.5] = 1
+    displace_mask[:, 0:1, :, :][pred_masks[0][:10] > 0.5] = 1
+    displace_mask[:, 1:2, :, :][pred_masks[1][:10] > 0.5] = 1
+    displace_mask[:, 2:3, :, :][pred_masks[2][:10] > 0.5] = 1
     grid_image = make_grid(displace_mask.clone().cpu().data, 10, normalize=True, scale_each=True)
     summary.writer.add_image(f'{prefix}_pred/pred', grid_image, global_step)
 
     if affine_masks is not None:
+        affine_masks[1][affine_masks[0] > 0.5] = 0
         displace_mask = torch.zeros_like(mask[:10, :, :, :])
-        displace_mask[:, 1:2, :, :][affine_masks[0][:10] > 0.5] = 1
-        displace_mask[:, 2:3, :, :][affine_masks[1][:10] > 0.5] = 1
+        displace_mask[:, 0:1, :, :][affine_masks[0][:10] > 0.5] = 1
+        displace_mask[:, 1:2, :, :][affine_masks[1][:10] > 0.5] = 1
+        displace_mask[:, 2:3, :, :][affine_masks[2][:10] > 0.5] = 1
         grid_image = make_grid(displace_mask.clone().cpu().data, 10, normalize=True, scale_each=True)
         summary.writer.add_image(f'{prefix}_pred/affine', grid_image, global_step)
 
@@ -181,7 +189,7 @@ def val_segnet_epoch(model, data_loader, epoch, args, summary, device):
     return np.mean(np.array(mIoU_ac)), np.mean(np.array(mAP_ac)), np.mean(np.array(mF1_ac)), np.mean(np.array(mMask_ac))
 
 
-def train_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device):
+def train_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device, affine_epoch):
     model.train()
     iterator = tqdm(data_loader)
 
@@ -192,16 +200,17 @@ def train_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device
         g_map = g_map.to(device)
 
         # pred_masks, pred_nodes, disp, bdry, dt = model(image, mask, args.iter)
-        pred_masks1, pred_masks2, nodes1, nodes2, disp = model(image, args.iter)
+        pred_masks0, pred_masks1, pred_masks2, nodes0, nodes1, nodes2, disp = model(image, args.iter)
 
         start_index = 1
-        g_map_lambda = 10
-        loss_gmap = g_map_lambda * F.mse_loss(disp, g_map)
+        # g_map_lambda = 10
+        # loss_gmap = g_map_lambda * F.mse_loss(disp, g_map)
 
-        loss_ac = loss_gmap
+        # loss_ac = loss_gmap
+        loss_ac = 0
         global_step = epoch * len(data_loader) + i
 
-        for mask_idx, pred_masks, nodes in zip([1, 2], [pred_masks1, pred_masks2], [nodes1, nodes2]):
+        for mask_idx, pred_masks, nodes in zip([0, 1, 2], [pred_masks0, pred_masks1, pred_masks2], [nodes0, nodes1, nodes2]):
             loss_masks = [
                 F.mse_loss(pred_masks[k].squeeze(1), mask[:, mask_idx, :, :])
                 for k in range(start_index, len(pred_masks))
@@ -230,7 +239,10 @@ def train_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device
                     args.lmd_curve * loss_curve[j + start_index]
                     for j in range(len(loss_masks[start_index:-1]))
                 ]
-            loss_ac += sum(loss_masks_agg) + sum(loss_balloon_agg) + sum(loss_curve_agg) + loss_affine_masks
+            if epoch > affine_epoch:
+                loss_ac += sum(loss_masks_agg) + sum(loss_balloon_agg) + sum(loss_curve_agg) + loss_affine_masks
+            else:
+                loss_ac += loss_affine_masks
 
             iou_ac = np.mean(get_iou(pred_masks[-1].gt(0.5), mask[:, mask_idx, :, :].bool()))
             affine_iou_ac = np.mean(get_iou(pred_masks[0].gt(0.5), mask[:, mask_idx, :, :].bool()))
@@ -269,14 +281,14 @@ def train_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device
         summary.add_scalar('train/loss_ac', loss_ac.item(), global_step)
 
         # summary.add_scalar('train/loss_dist_agg', sum(loss_dist_agg).item(), global_step)
-        summary.add_scalar('train/loss_gmap', loss_gmap.item(), global_step)
+        # summary.add_scalar('train/loss_gmap', loss_gmap.item(), global_step)
         #
 
         visualise_images(
             image=image,
             mask=mask,
-            pred_masks=[pred_masks1[-1], pred_masks2[-1]],
-            affine_masks=[pred_masks1[0], pred_masks2[0]],
+            pred_masks=[pred_masks0[-1], pred_masks1[-1], pred_masks2[-1]],
+            affine_masks=[pred_masks0[0], pred_masks1[0], pred_masks2[0]],
             disp=disp,
             g_map=g_map,
             global_step=global_step,
@@ -288,17 +300,17 @@ def val_acdr_epoch(model, data_loader, epoch, args, summary, device):
     model.eval()
     iterator = tqdm(data_loader)
 
-    mIoU_ac, mAP_ac, mF1_ac = [[], []], [[], []], [[], []]
-    mMask_ac = [[], []]
+    mIoU_ac, mAP_ac, mF1_ac = [[], [], []], [[], [], []], [[], [], []]
+    mMask_ac = [[], [], []]
     for i, (image, mask, g_map) in enumerate(iterator):
         global_step = (epoch // args.eval_rate) * len(data_loader) + i
         image = image.to(device)
         mask = mask.to(device)
         g_map = g_map.to(device)
 
-        affine_mask1, pred_mask1, affine_mask2, pred_mask2, disp = model(image, args.iter)
+        affine_mask0, pred_mask0, affine_mask1, pred_mask1, affine_mask2, pred_mask2, disp = model(image, args.iter)
         loss_masks_ac_total = 0
-        for mask_idx, pred_mask in zip([1, 2], [pred_mask1, pred_mask2]):
+        for mask_idx, pred_mask in zip([0, 1, 2], [pred_mask0, pred_mask1, pred_mask2]):
             pred_mask_ac = F.interpolate(pred_mask, size=mask.shape[2:], mode='bilinear')
 
             loss_masks_ac = F.mse_loss(pred_mask_ac.squeeze(1), mask[:, mask_idx, :, :])
@@ -307,10 +319,10 @@ def val_acdr_epoch(model, data_loader, epoch, args, summary, device):
             iou_ac = get_iou(pred_mask_ac.gt(0.5), mask[:, mask_idx, :, :].bool())
             ap_ac = get_ap_scores(pred_mask_ac.gt(0.5), mask[:, mask_idx, :, :])
             f1_ac = get_f1_scores(pred_mask_ac.gt(0.5), mask[:, mask_idx, :, :])
-            mIoU_ac[mask_idx - 1] += iou_ac
-            mAP_ac[mask_idx - 1] += ap_ac
-            mF1_ac[mask_idx - 1] += f1_ac
-            mMask_ac[mask_idx - 1] += [loss_masks_ac.item()]
+            mIoU_ac[mask_idx] += iou_ac
+            mAP_ac[mask_idx] += ap_ac
+            mF1_ac[mask_idx] += f1_ac
+            mMask_ac[mask_idx] += [loss_masks_ac.item()]
             loss_masks_ac_total += loss_masks_ac
 
             ind = np.argwhere(np.array(iou_ac) < 0.5).flatten().tolist()
@@ -323,34 +335,34 @@ def val_acdr_epoch(model, data_loader, epoch, args, summary, device):
                     pred_mask_ac[ind],
                     global_step
                 )
-                grid_image = make_grid(
-                    disp[ind][:3, (mask_idx - 1) * 2, :, :].unsqueeze(1).clone().cpu().data, 3,
-                    normalize=True, scale_each=True
-                )
-                summary.writer.add_image('val_BAD_{}/Disp_x'.format(mask_idx), grid_image, global_step)
+                # grid_image = make_grid(
+                #     disp[ind][:3, (mask_idx) * 2, :, :].unsqueeze(1).clone().cpu().data, 3,
+                #     normalize=True, scale_each=True
+                # )
+                # summary.writer.add_image('val_BAD_{}/Disp_x'.format(mask_idx), grid_image, global_step)
+
+                # grid_image = make_grid(
+                #     disp[ind][:3, (mask_idx) * 2 + 1, :, :].unsqueeze(1).clone().cpu().data, 3,
+                #     normalize=True, scale_each=True
+                # )
+                # summary.writer.add_image('val_BAD_{}/Disp_y'.format(mask_idx), grid_image, global_step)
 
                 grid_image = make_grid(
-                    disp[ind][:3, (mask_idx - 1) * 2 + 1, :, :].unsqueeze(1).clone().cpu().data, 3,
-                    normalize=True, scale_each=True
-                )
-                summary.writer.add_image('val_BAD_{}/Disp_y'.format(mask_idx), grid_image, global_step)
-
-                grid_image = make_grid(
-                    g_map[ind][:3, (mask_idx - 1) * 2, :, :].unsqueeze(1).clone().cpu().data, 3,
+                    g_map[ind][:3, (mask_idx) * 2, :, :].unsqueeze(1).clone().cpu().data, 3,
                     normalize=True, scale_each=True
                 )
                 summary.writer.add_image('val_BAD_{}/Gmap_x'.format(mask_idx), grid_image, global_step)
 
                 grid_image = make_grid(
-                    g_map[ind][:3, (mask_idx - 1) * 2 + 1, :, :].unsqueeze(1).clone().cpu().data, 3,
+                    g_map[ind][:3, (mask_idx) * 2 + 1, :, :].unsqueeze(1).clone().cpu().data, 3,
                     normalize=True, scale_each=True
                 )
                 summary.writer.add_image('val_BAD_{}/Gmap_y'.format(mask_idx), grid_image, global_step)
         visualise_images(
             image=image,
             mask=mask,
-            pred_masks=[pred_mask1, pred_mask2],
-            affine_masks=[affine_mask1, affine_mask2],
+            pred_masks=[pred_mask0, pred_mask1, pred_mask2],
+            affine_masks=[affine_mask0, affine_mask1, affine_mask2],
             disp=disp,
             g_map=g_map,
             global_step=global_step,
@@ -369,11 +381,11 @@ def val_acdr_epoch(model, data_loader, epoch, args, summary, device):
         # summary.add_scalar('val/ap_ac', np.mean(ap_ac), global_step)
 
     global_step = epoch // args.eval_rate
-    for i in range(2):
-        summary.add_scalar('val/mIoU_ac_{}'.format(i+1), np.mean(mIoU_ac[i]), global_step)
-        summary.add_scalar('val/mAP_ac_{}'.format(i+1), np.mean(mAP_ac[i]), global_step)
-        summary.add_scalar('val/mF1_ac_{}'.format(i+1), np.mean(mF1_ac[i]), global_step)
-        summary.add_scalar('val/mMask_ac_{}'.format(i+1), np.mean(mMask_ac[i]), global_step)
+    for i in range(3):
+        summary.add_scalar('val/mIoU_ac_{}'.format(i), np.mean(mIoU_ac[i]), global_step)
+        summary.add_scalar('val/mAP_ac_{}'.format(i), np.mean(mAP_ac[i]), global_step)
+        summary.add_scalar('val/mF1_ac_{}'.format(i), np.mean(mF1_ac[i]), global_step)
+        summary.add_scalar('val/mMask_ac_{}'.format(i), np.mean(mMask_ac[i]), global_step)
 
     return np.mean(np.array(mIoU_ac)), np.mean(np.array(mAP_ac)), np.mean(np.array(mF1_ac)), np.mean(np.array(mMask_ac))
 
@@ -396,11 +408,12 @@ if __name__ == '__main__':
     parser.add_argument('--lr-step', type=int,
                         default=200,
                         help='LR scheduler step')
+    parser.add_argument("--affine-epoch", type=int, default=100, help="number of epochs with just affine loss")
 
     # Architecture
     parser.add_argument('--arch', type=str,
                         default='acdrnet',
-                        choices=['acdrnet', 'segnet'],
+                        choices=['acdrnet', 'segnet', "deformnet"],
                         help='Network architecture. acdrnet or segnet')
     parser.add_argument('--image-size', type=int,
                         default=128,
@@ -518,8 +531,16 @@ if __name__ == '__main__':
         model = CardiacUNet(
             enc_dim=args.enc_dim,
             drop=args.drop,
+            output_dim=3
         ).to(device)
-
+    elif args.arch == "deformnet":
+        model = DeformCardiacCircleNet(
+            num_nodes=args.num_nodes,
+            enc_dim=args.enc_dim,
+            dec_size=args.dec_size,
+            image_size=args.image_size,
+            drop=args.drop,
+        ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=5e-5)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_step, gamma=0.1)
 
@@ -541,12 +562,12 @@ if __name__ == '__main__':
     for epoch in range(args.start_epoch, args.epochs):
         # scheduler.step()
         with torch.autograd.set_detect_anomaly(True):
-            if args.arch == "acdrnet":
-                train_acdr_epoch(model, optimizer, train_dl, epoch, args, summary, device)
+            if args.arch == "acdrnet" or args.arch == "deformnet":
+                train_acdr_epoch(model, optimizer, train_dl, epoch, args, summary, device, args.affine_epoch)
             if args.arch == "segnet":
                 train_segnet_epoch(model, optimizer, train_dl, epoch, args, summary, device)
         if epoch % args.eval_rate == 0:
-            if args.arch == "acdrnet":
+            if args.arch == "acdrnet" or args.arch == "deformnet":
                 mIoU_ac, mAP_ac, mF1_ac, mMask_ac = val_acdr_epoch(model, val_dl, epoch, args, summary, device)
             if args.arch == "segnet":
                 mIoU_ac, mAP_ac, mF1_ac, mMask_ac = val_segnet_epoch(model, val_dl, epoch, args, summary, device)
