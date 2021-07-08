@@ -9,6 +9,8 @@ from pathlib import Path
 
 from models.networks.cardiac import CardaicCircleNet, CardiacUNet
 from models.networks.deform import DeformCardiacCircleNet
+from models.networks.shape import ShapeDeformCardiacCircleNet
+
 
 from data.cityscapes_instances import CityscapesInstances, CityscapesInstances_comp
 from data.buildings import BuildingsDataset
@@ -19,11 +21,12 @@ from utils.metrices import get_ap_scores, get_iou, get_f1_scores
 from data import transforms
 from models.loss_functions import curvature_loss, dist_loss
 from torchvision.utils import make_grid
+from models.loss_functions import Grad
 # --resume
 # C:\Users\lisur\PycharmProjects\ACDRNet-master\run\buildings\rider_DEBUG_unet\experiment_16\checkpoint.pth.tar
 
 
-def visualise_images(image, mask, pred_masks, affine_masks, disp, g_map, global_step, prefix: str = "train"):
+def visualise_images(image, mask, pred_masks, affine_masks, disp, g_map, global_step, prefix: str = "train", init_masks=None):
     grid_image = make_grid(image[:10, :, :, :].clone().cpu().data, 10, normalize=True, scale_each=True)
     summary.writer.add_image(f'{prefix}_image/image', grid_image, global_step)
     displace_mask = torch.zeros_like(mask[:10, :, :, :])
@@ -34,13 +37,13 @@ def visualise_images(image, mask, pred_masks, affine_masks, disp, g_map, global_
     grid_image = make_grid(displace_mask.clone().cpu().data, 10, normalize=True, scale_each=True)
     summary.writer.add_image(f'{prefix}_mask/mask', grid_image, global_step)
 
-    pred_masks[1][pred_masks[0] > 0.5] = 0
-    displace_mask = torch.zeros_like(mask[:10, :, :, :])
-    displace_mask[:, 0:1, :, :][pred_masks[0][:10] > 0.5] = 1
-    displace_mask[:, 1:2, :, :][pred_masks[1][:10] > 0.5] = 1
-    displace_mask[:, 2:3, :, :][pred_masks[2][:10] > 0.5] = 1
-    grid_image = make_grid(displace_mask.clone().cpu().data, 10, normalize=True, scale_each=True)
-    summary.writer.add_image(f'{prefix}_pred/pred', grid_image, global_step)
+    if pred_masks is not None:
+        displace_mask = torch.zeros_like(mask[:10, :, :, :])
+        pred_masks[1][pred_masks[0] > 0.5] = 0
+        for idx in range(len(pred_masks)):
+            displace_mask[:, idx:idx+1, :, :][pred_masks[idx][:10] > 0.5] = 1
+        grid_image = make_grid(displace_mask.clone().cpu().data, 10, normalize=True, scale_each=True)
+        summary.writer.add_image(f'{prefix}_pred/pred', grid_image, global_step)
 
     if affine_masks is not None:
         affine_masks[1][affine_masks[0] > 0.5] = 0
@@ -50,6 +53,16 @@ def visualise_images(image, mask, pred_masks, affine_masks, disp, g_map, global_
         displace_mask[:, 2:3, :, :][affine_masks[2][:10] > 0.5] = 1
         grid_image = make_grid(displace_mask.clone().cpu().data, 10, normalize=True, scale_each=True)
         summary.writer.add_image(f'{prefix}_pred/affine', grid_image, global_step)
+
+    if init_masks is not None:
+        init_masks[1][init_masks[0] > 0.5] = 0
+        displace_mask = torch.zeros_like(mask[:10, :, :, :])
+        displace_mask[:, 0:1, :, :][init_masks[0][:10] > 0.5] = 1
+        displace_mask[:, 1:2, :, :][init_masks[1][:10] > 0.5] = 1
+        displace_mask[:, 2:3, :, :][init_masks[2][:10] > 0.5] = 1
+        grid_image = make_grid(displace_mask.clone().cpu().data, 10, normalize=True, scale_each=True)
+        summary.writer.add_image(f'{prefix}_pred/init', grid_image, global_step)
+
 
     if disp is not None:
         grid_image = make_grid(disp[:3, 0:1, :, :].clone().cpu().data, 3, normalize=True, scale_each=True)
@@ -92,7 +105,6 @@ def train_segnet_epoch(model, optimizer, data_loader, epoch, args, summary, devi
             summary.add_scalar('train/iou_ac_{}'.format(mask_idx), np.mean(iou_ac), global_step)
             summary.add_scalar('train/ap_ac_{}'.format(mask_idx), np.mean(ap_ac), global_step)
             summary.add_scalar('train/f1_ac_{}'.format(mask_idx), np.mean(f1_ac), global_step)
-
 
         optimizer.zero_grad()
         loss.backward()
@@ -189,9 +201,111 @@ def val_segnet_epoch(model, data_loader, epoch, args, summary, device):
     return np.mean(np.array(mIoU_ac)), np.mean(np.array(mAP_ac)), np.mean(np.array(mF1_ac)), np.mean(np.array(mMask_ac))
 
 
+
+def plot(flow, image, mask, affine_masks, deformed_masks):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    import torch.nn.functional as F
+
+    def plot_grid(x, y, ax=None, **kwargs):
+        ax = ax or plt.gca()
+        segs1 = np.stack((x, y), axis=2)
+        segs2 = segs1.transpose(1, 0, 2)
+        ax.add_collection(LineCollection(segs1, **kwargs))
+        ax.add_collection(LineCollection(segs2, **kwargs))
+        ax.autoscale()
+
+    # fig, ax = plt.subplots()
+    n = 80
+    grid_x, grid_y = np.meshgrid(np.linspace(0, 127, n), np.linspace(0, 127, n))
+    # plot_grid(grid_x, grid_y, ax=ax, color="lightgrey")
+    # plt.show()
+    torch_grid = torch.stack([torch.from_numpy(grid_x), torch.from_numpy(grid_y)], dim=2).cuda().float().unsqueeze(0)
+    sample_grid = torch.stack([torch.from_numpy(grid_x), torch.from_numpy(grid_y)], dim=2).cuda().float().unsqueeze(0)
+
+    for i in range(2):
+        torch_grid[..., i] = 2 * (torch_grid[..., i] / (128 - 1) - 0.5)
+
+    for i in range(2):
+        sample_grid[..., i] = 2 * (sample_grid[..., i] / (128 - 1) - 0.5)
+    for b in range(10):
+        fig, ax = plt.subplots()
+
+        plot_grid(grid_x, grid_y, ax=ax, color="lightgrey")
+        # sample_grid[..., 1] = sample_grid[..., 1] * -1
+
+        # Pxx = F.grid_sample(flow[b].unsqueeze(0), torch_grid).transpose(3, 2)
+        Pxx = F.grid_sample(flow[b].unsqueeze(0)[:, 0:1], sample_grid)
+        Pyy = F.grid_sample(flow[b].unsqueeze(0)[:, 1:2], sample_grid)
+        dP0 = torch.stack((Pxx, Pyy), -1).squeeze(0)
+        # Pyy = F.grid_sample(flow[b, 1:2].unsqueeze(0), torch_grid).transpose(3, 2)
+        # dist = torch_grid + dP0.permute([0, 2, 3, 1])
+        dist = sample_grid + dP0
+        # sample_grid[..., 1] = sample_grid[..., 1] * -1
+
+        # dist[..., 1] = dist[..., 1] * -1
+        dist = (dist / 2 + 0.5) * 127
+
+        distx = dist.squeeze(0)[:, :, 0]
+        disty = dist.squeeze(0)[:, :, 1]
+        distx = distx.detach().cpu().numpy()
+        disty = disty.detach().cpu().numpy()
+
+
+        # plt.figure()
+        # plt.imshow(image[0].squeeze(0).detach().cpu().numpy())
+        # plt.figure()
+        # displace_mask = torch.zeros_like(mask[b, :, :, :])
+        # mask[b, 1, :, :][mask[b, 0, :, :] > 0.5] = 0
+        # displace_mask[0, :, :][mask[b, 0, :, :] > 0.5] = 1
+        # displace_mask[1, :, :][mask[b, 1, :, :] > 0.5] = 1
+        # displace_mask[2, :, :][mask[b, 2, :, :] > 0.5] = 1
+        # displace_mask[0, :, :][(mask[b, 0, :, :] < 0.5) & (mask[b, 1, :, :] < 0.5) & (mask[b, 2, :, :] < 0.5)] = 1
+        # displace_mask[1, :, :][(mask[b, 0, :, :] < 0.5) & (mask[b, 1, :, :] < 0.5) & (mask[b, 2, :, :] < 0.5)] = 1
+        # displace_mask[2, :, :][(mask[b, 0, :, :] < 0.5) & (mask[b, 1, :, :] < 0.5) & (mask[b, 2, :, :] < 0.5)] = 1
+
+        displace_mask = torch.zeros_like(mask[b, :, :, :])
+        affine_masks[1][b, 0, :, :][affine_masks[0][b, 0, :, :] >= 0.5] = 0
+        displace_mask[0, :, :][affine_masks[0][b, 0, :, :] >= 0.5] = 1
+        displace_mask[1, :, :][affine_masks[1][b, 0, :, :] >= 0.5] = 1
+        displace_mask[2, :, :][affine_masks[2][b, 0, :, :] >= 0.5] = 1
+        displace_mask[0, :, :][(affine_masks[0][b, 0, :, :] < 0.5) & (affine_masks[1][b, 0, :, :] < 0.5) & (affine_masks[2][b, 0, :, :] < 0.5)] = 1
+        displace_mask[1, :, :][(affine_masks[0][b, 0, :, :] < 0.5) & (affine_masks[1][b, 0, :, :] < 0.5) & (affine_masks[2][b, 0, :, :] < 0.5)] = 1
+        displace_mask[2, :, :][(affine_masks[0][b, 0, :, :] < 0.5) & (affine_masks[1][b, 0, :, :] < 0.5) & (affine_masks[2][b, 0, :, :] < 0.5)] = 1
+
+        displace_mask = displace_mask.permute(1, 2, 0)
+        plt.imshow(displace_mask.detach().cpu().numpy())
+        plot_grid(distx, disty, ax=ax, color="C0")
+
+        # plt.show()
+        fig, ax = plt.subplots()
+
+        plot_grid(grid_x, grid_y, ax=ax, color="lightgrey")
+        displace_mask = torch.zeros_like(mask[b, :, :, :])
+        deformed_masks[1][b, 0, :, :][deformed_masks[0][b, 0, :, :] >= 0.5] = 0
+        displace_mask[0, :, :][deformed_masks[0][b, 0, :, :] >= 0.5] = 1
+        displace_mask[1, :, :][deformed_masks[1][b, 0, :, :] >= 0.5] = 1
+        displace_mask[2, :, :][deformed_masks[2][b, 0, :, :] >= 0.5] = 1
+        displace_mask[0, :, :][(deformed_masks[0][b, 0, :, :] < 0.5) & (deformed_masks[1][b, 0, :, :] < 0.5) & (deformed_masks[2][b, 0, :, :] < 0.5)] = 1
+        displace_mask[1, :, :][(deformed_masks[0][b, 0, :, :] < 0.5) & (deformed_masks[1][b, 0, :, :] < 0.5) & (deformed_masks[2][b, 0, :, :] < 0.5)] = 1
+        displace_mask[2, :, :][(deformed_masks[0][b, 0, :, :] < 0.5) & (deformed_masks[1][b, 0, :, :] < 0.5) & (deformed_masks[2][b, 0, :, :] < 0.5)] = 1
+
+        displace_mask = displace_mask.permute(1, 2, 0)
+        plt.imshow(displace_mask.detach().cpu().numpy())
+        plot_grid(distx, disty, ax=ax, color="C0")
+
+        fig, ax = plt.subplots()
+        plot_grid(grid_x, grid_y, ax=ax, color="lightgrey")
+        plt.imshow(image[b].squeeze(0).detach().cpu().numpy())
+        plot_grid(distx, disty, ax=ax, color="C0")
+        plt.show()
+
+
 def train_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device, affine_epoch):
     model.train()
     iterator = tqdm(data_loader)
+    flow_grad_loss = Grad(penalty="l2")
 
     for i, (image, mask, g_map) in enumerate(iterator):
 
@@ -200,8 +314,8 @@ def train_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device
         g_map = g_map.to(device)
 
         # pred_masks, pred_nodes, disp, bdry, dt = model(image, mask, args.iter)
-        pred_masks0, pred_masks1, pred_masks2, nodes0, nodes1, nodes2, disp = model(image, args.iter)
-
+        pred_masks0, pred_masks1, pred_masks2, nodes0, nodes1, nodes2, disp, preint_flow = model(image, args.iter)
+        plot(disp, image, mask, [pred_masks0[0], pred_masks1[0], pred_masks2[0]], [pred_masks0[-1], pred_masks1[-1], pred_masks2[-1]])
         start_index = 1
         # g_map_lambda = 10
         # loss_gmap = g_map_lambda * F.mse_loss(disp, g_map)
@@ -209,6 +323,9 @@ def train_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device
         # loss_ac = loss_gmap
         loss_ac = 0
         global_step = epoch * len(data_loader) + i
+        if epoch > affine_epoch:
+            flow_loss = flow_grad_loss(preint_flow)
+            loss_ac += flow_loss * 10000
 
         for mask_idx, pred_masks, nodes in zip([0, 1, 2], [pred_masks0, pred_masks1, pred_masks2], [nodes0, nodes1, nodes2]):
             loss_masks = [
@@ -240,7 +357,7 @@ def train_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device
                     for j in range(len(loss_masks[start_index:-1]))
                 ]
             if epoch > affine_epoch:
-                loss_ac += sum(loss_masks_agg) + sum(loss_balloon_agg) + sum(loss_curve_agg) + loss_affine_masks
+                loss_ac += sum(loss_masks_agg) + loss_affine_masks
             else:
                 loss_ac += loss_affine_masks
 
@@ -309,6 +426,9 @@ def val_acdr_epoch(model, data_loader, epoch, args, summary, device):
         g_map = g_map.to(device)
 
         affine_mask0, pred_mask0, affine_mask1, pred_mask1, affine_mask2, pred_mask2, disp = model(image, args.iter)
+
+        # plot(disp, image, mask, [affine_mask0, affine_mask1, affine_mask2], [pred_mask0, pred_mask1, pred_mask2])
+
         loss_masks_ac_total = 0
         for mask_idx, pred_mask in zip([0, 1, 2], [pred_mask0, pred_mask1, pred_mask2]):
             pred_mask_ac = F.interpolate(pred_mask, size=mask.shape[2:], mode='bilinear')
@@ -390,6 +510,169 @@ def val_acdr_epoch(model, data_loader, epoch, args, summary, device):
     return np.mean(np.array(mIoU_ac)), np.mean(np.array(mAP_ac)), np.mean(np.array(mF1_ac)), np.mean(np.array(mMask_ac))
 
 
+def train_shape_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, device, affine_epoch):
+    model.train()
+    iterator = tqdm(data_loader)
+    flow_grad_loss = Grad(penalty="l2")
+
+    for i, (image, mask, g_map) in enumerate(iterator):
+
+        image = image.to(device)
+        mask = mask.to(device)
+        g_map = g_map.to(device)
+
+        # pred_masks, pred_nodes, disp, bdry, dt = model(image, mask, args.iter)
+        preint_flow, init_mask0, init_mask1, init_mask2, \
+        affine_mask0, affine_mask1, affine_mask2, \
+        deform_mask0, deform_mask1, deform_mask2 = model(image, args.iter)
+        # g_map_lambda = 10
+        # loss_gmap = g_map_lambda * F.mse_loss(disp, g_map)
+
+        # loss_ac = loss_gmap
+        loss_ac = 0
+        global_step = epoch * len(data_loader) + i
+        if epoch > affine_epoch:
+            flow_loss = flow_grad_loss(preint_flow)
+            loss_ac += flow_loss * 10000
+        m_f1 = []
+        m_mse = []
+        for mask_idx, affine_mask, init_mask, deform_mask in zip(
+                [0, 1, 2],
+                [affine_mask0, affine_mask1, affine_mask2],
+                [init_mask0, init_mask1, init_mask2],
+                [deform_mask0, deform_mask1, deform_mask2]
+        ):
+            loss_init_mask = F.mse_loss(init_mask.squeeze(1), mask[:, mask_idx, :, :])
+            loss_affine_mask = F.mse_loss(affine_mask.squeeze(1), mask[:, mask_idx, :, :])
+            loss_deform_mask = F.mse_loss(deform_mask.squeeze(1), mask[:, mask_idx, :, :])
+
+            if epoch > affine_epoch:
+                loss_ac += loss_init_mask + loss_affine_mask + loss_deform_mask
+            else:
+                loss_ac += loss_init_mask + loss_affine_mask
+
+            f1_init_ac = np.mean(get_f1_scores(init_mask.gt(0.5), mask[:, mask_idx, :, :]))
+            f1_affine_ac = np.mean(get_f1_scores(affine_mask.gt(0.5), mask[:, mask_idx, :, :]))
+            f1_deform_ac = np.mean(get_f1_scores(deform_mask.gt(0.5), mask[:, mask_idx, :, :]))
+
+            summary.add_scalar('train/f1_init_{}'.format(mask_idx), np.mean(f1_init_ac), global_step)
+            summary.add_scalar('train/f1_affine_{}'.format(mask_idx), np.mean(f1_affine_ac), global_step)
+            summary.add_scalar('train/f1_deform_{}'.format(mask_idx), np.mean(f1_deform_ac), global_step)
+            summary.add_scalar('train/mse_deform_{}'.format(mask_idx), loss_deform_mask.item(), global_step)
+            m_f1 += [f1_deform_ac]
+            m_mse += [loss_deform_mask.item()]
+        loss = loss_ac
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        #
+        iterator.set_description(
+            '(train | {}) Epoch [{epoch}/{epochs}] :: Loss {loss:.4f} | Loss AC {loss_ac:.4f}'.format(
+                args.checkname + '_' + args.exp,
+                epoch=epoch + 1,
+                epochs=args.epochs,
+                loss=loss.item(),
+                loss_ac=loss_ac.item()))
+        #
+        global_step = epoch * len(data_loader) + i
+        summary.add_scalar('train/loss', loss.item(), global_step)
+        summary.add_scalar('train/m_f1_deform', np.mean(np.array(m_f1)), global_step)
+        summary.add_scalar('train/m_mse_deform', np.mean(np.array(m_mse)), global_step)
+
+        visualise_images(
+            image=image,
+            mask=mask,
+            pred_masks=[deform_mask0, deform_mask1, deform_mask2],
+            affine_masks=[affine_mask0, affine_mask1, affine_mask2],
+            init_masks=[init_mask0, init_mask1, init_mask2],
+            disp=None,
+            g_map=g_map,
+            global_step=global_step,
+            prefix="train"
+        )
+
+
+def val_shape_acdr_epoch(model, data_loader, epoch, args, summary, device):
+    model.eval()
+    iterator = tqdm(data_loader)
+
+    mf1_init_ac = [[], [], []]
+    mf1_affine_ac = [[], [], []]
+    mf1_deform_ac = [[], [], []]
+
+    mMask_ac = [[], [], []]
+    m_loss = []
+    for i, (image, mask, g_map) in enumerate(iterator):
+        global_step = (epoch // args.eval_rate) * len(data_loader) + i
+        image = image.to(device)
+        mask = mask.to(device)
+        g_map = g_map.to(device)
+
+        init_mask0, init_mask1, init_mask2, \
+        affine_mask0, affine_mask1, affine_mask2, \
+        deform_mask0, deform_mask1, deform_mask2 = model(image, args.iter)
+
+        # plot(disp, image, mask, [affine_mask0, affine_mask1, affine_mask2], [pred_mask0, pred_mask1, pred_mask2])
+
+        for mask_idx, affine_mask, init_mask, deform_mask in zip(
+            [0, 1, 2],
+            [affine_mask0, affine_mask1, affine_mask2],
+            [init_mask0, init_mask1, init_mask2],
+            [deform_mask0, deform_mask1, deform_mask2],
+        ):
+            affine_mask_ac = F.interpolate(affine_mask, size=mask.shape[2:], mode='bilinear')
+            affine_mask_ac = F.mse_loss(affine_mask_ac.squeeze(1), mask[:, mask_idx, :, :])
+
+            init_mask_ac = F.interpolate(init_mask, size=mask.shape[2:], mode='bilinear')
+            init_mask_ac = F.mse_loss(init_mask_ac.squeeze(1), mask[:, mask_idx, :, :])
+
+            deform_mask_ac = F.interpolate(deform_mask, size=mask.shape[2:], mode='bilinear')
+            deform_mask_ac = F.mse_loss(deform_mask_ac.squeeze(1), mask[:, mask_idx, :, :])
+
+            # Metrices
+            f1_init_ac = get_f1_scores(init_mask.gt(0.5), mask[:, mask_idx, :, :])
+            f1_affine_ac = get_f1_scores(affine_mask.gt(0.5), mask[:, mask_idx, :, :])
+            f1_deform_ac = get_f1_scores(deform_mask.gt(0.5), mask[:, mask_idx, :, :])
+            mf1_init_ac[mask_idx] += f1_init_ac
+            mf1_affine_ac[mask_idx] += f1_affine_ac
+            mf1_deform_ac[mask_idx] += f1_deform_ac
+
+            mMask_ac[mask_idx].append(deform_mask_ac.item())
+            m_loss.append((deform_mask_ac + init_mask_ac + affine_mask_ac).item())
+        visualise_images(
+            image=image,
+            mask=mask,
+            pred_masks=[deform_mask0, deform_mask1, deform_mask2],
+            affine_masks=[affine_mask0, affine_mask1, affine_mask2],
+            init_masks=[init_mask0, init_mask1, init_mask2],
+            disp=None,
+            g_map=g_map,
+            global_step=global_step,
+            prefix="val"
+        )
+
+        iterator.set_description(
+            '(val   | {}) Epoch [{epoch}/{epochs}] :: Loss AC {loss_ac:.4f}'.format(
+                args.checkname + '_' + args.exp,
+                epoch=epoch + 1,
+                epochs=args.epochs,
+                loss_ac=np.mean(m_loss)))
+
+    global_step = epoch // args.eval_rate
+    for i in range(3):
+        summary.add_scalar('val/m_f1_init_ac_{}'.format(i), np.mean(mf1_init_ac[i]), global_step)
+        summary.add_scalar('val/m_f1_affine_ac_{}'.format(i), np.mean(mf1_affine_ac[i]), global_step)
+        summary.add_scalar('val/m_f1_deform_ac_{}'.format(i), np.mean(mf1_deform_ac[i]), global_step)
+        summary.add_scalar('val/m_mse_deform_ac_{}'.format(i), np.mean(mMask_ac[i]), global_step)
+
+    global_step = epoch // args.eval_rate
+    summary.add_scalar('val/m_f1_deform_ac', np.mean(np.array(mf1_deform_ac)), global_step)
+    summary.add_scalar('val/m_mse_deform_ac',  np.mean(np.array(mMask_ac)), global_step)
+    summary.add_scalar('val/loss_ac', np.mean(m_loss), global_step)
+    return np.mean(np.array(mf1_deform_ac))
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train a segmentation')
     # Training
@@ -413,7 +696,7 @@ if __name__ == '__main__':
     # Architecture
     parser.add_argument('--arch', type=str,
                         default='acdrnet',
-                        choices=['acdrnet', 'segnet', "deformnet"],
+                        choices=['acdrnet', 'segnet', "deformnet", "shapenet"],
                         help='Network architecture. acdrnet or segnet')
     parser.add_argument('--image-size', type=int,
                         default=128,
@@ -541,6 +824,14 @@ if __name__ == '__main__':
             image_size=args.image_size,
             drop=args.drop,
         ).to(device)
+    elif args.arch == "shapenet":
+        model = ShapeDeformCardiacCircleNet(
+            num_nodes=args.num_nodes,
+            enc_dim=args.enc_dim,
+            dec_size=args.dec_size,
+            image_size=args.image_size,
+            drop=args.drop,
+        ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=5e-5)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_step, gamma=0.1)
 
@@ -566,17 +857,28 @@ if __name__ == '__main__':
                 train_acdr_epoch(model, optimizer, train_dl, epoch, args, summary, device, args.affine_epoch)
             if args.arch == "segnet":
                 train_segnet_epoch(model, optimizer, train_dl, epoch, args, summary, device)
+            if args.arch == "shapenet":
+                train_shape_acdr_epoch(model, optimizer, train_dl, epoch, args, summary, device, args.affine_epoch)
+
         if epoch % args.eval_rate == 0:
             if args.arch == "acdrnet" or args.arch == "deformnet":
                 mIoU_ac, mAP_ac, mF1_ac, mMask_ac = val_acdr_epoch(model, val_dl, epoch, args, summary, device)
+                global_step = epoch // args.eval_rate
+                summary.add_scalar('val/mIoU_ac', mIoU_ac, global_step)
+                summary.add_scalar('val/mAP_ac', mAP_ac, global_step)
+                summary.add_scalar('val/mF1_ac', mF1_ac, global_step)
+                summary.add_scalar('val/mMask_ac', mMask_ac, global_step)
             if args.arch == "segnet":
                 mIoU_ac, mAP_ac, mF1_ac, mMask_ac = val_segnet_epoch(model, val_dl, epoch, args, summary, device)
 
-            global_step = epoch // args.eval_rate
-            summary.add_scalar('val/mIoU_ac', mIoU_ac, global_step)
-            summary.add_scalar('val/mAP_ac', mAP_ac, global_step)
-            summary.add_scalar('val/mF1_ac', mF1_ac, global_step)
-            summary.add_scalar('val/mMask_ac', mMask_ac, global_step)
+                global_step = epoch // args.eval_rate
+                summary.add_scalar('val/mIoU_ac', mIoU_ac, global_step)
+                summary.add_scalar('val/mAP_ac', mAP_ac, global_step)
+                summary.add_scalar('val/mF1_ac', mF1_ac, global_step)
+                summary.add_scalar('val/mMask_ac', mMask_ac, global_step)
+
+            if args.arch == "shapenet":
+                mIoU_ac = val_shape_acdr_epoch(model, val_dl, epoch, args, summary, device)
 
             is_best = False
             if mIoU_ac > best_pred:
