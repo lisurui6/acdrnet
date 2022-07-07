@@ -1,0 +1,15 @@
+torch
+tqdm
+shapely
+matplotlib
+git clone https://github.com/ZhengZerong/neural_renderer
+cd neural_renderer
+pip install .
+pycocotools
+h5py
+opencv-python
+tensorboard
+scikit-learn
+open3d
+vtk
+mayavi

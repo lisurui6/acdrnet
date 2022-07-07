@@ -4,3 +4,12 @@
 run/
 *.pyc
 __pycache__/
+.vs/
+dist/
+build/
+rbh_3d_data/
+rbh_2d_data
+*.egg-info/
+latex/
+*.nii.gz
+*.pth

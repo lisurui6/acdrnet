@@ -10,10 +10,10 @@ from pathlib import Path
 from models.networks.cardiac import CardaicCircleNet, CardiacUNet
 from models.networks.deform import DeformCardiacCircleNet
 from models.networks.shape import ShapeDeformCardiacCircleNet
+# from models.networks.shape_2 import ShapeDeformCardiacCircleNet
 
+from sklearn.neural_network import BernoulliRBM
 
-from data.cityscapes_instances import CityscapesInstances, CityscapesInstances_comp
-from data.buildings import BuildingsDataset
 from data.cardiac import CardiacDataset
 from utils.saver import Saver
 from utils.summaries import TensorboardSummary
@@ -199,6 +199,116 @@ def val_segnet_epoch(model, data_loader, epoch, args, summary, device):
         summary.add_scalar('val/mMask_ac_{}'.format(i+1), np.mean(mMask_ac[i]), global_step)
 
     return np.mean(np.array(mIoU_ac)), np.mean(np.array(mAP_ac)), np.mean(np.array(mF1_ac)), np.mean(np.array(mMask_ac))
+
+
+def plot_2(flow, image, mask, affine_masks, deformed_masks):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    import torch.nn.functional as F
+
+    def plot_grid(x, y, ax=None, **kwargs):
+        ax = ax or plt.gca()
+        segs1 = np.stack((x, y), axis=2)
+        segs2 = segs1.transpose(1, 0, 2)
+        ax.add_collection(LineCollection(segs1, **kwargs))
+        ax.add_collection(LineCollection(segs2, **kwargs))
+        ax.autoscale()
+
+    # fig, ax = plt.subplots()
+    n = 128
+    # grid_x, grid_y = np.meshgrid(np.linspace(0, 127, n), np.linspace(0, 127, n))
+    # plot_grid(grid_x, grid_y, ax=ax, color="lightgrey")
+    # plt.show()
+    # torch_grid = torch.stack([torch.from_numpy(grid_x), torch.from_numpy(grid_y)], dim=0).cuda().float().unsqueeze(0)
+    # sample_grid = torch.stack([torch.from_numpy(grid_x), torch.from_numpy(grid_y)], dim=0).cuda().float().unsqueeze(0)
+    vectors = [torch.arange(0, s, 2) for s in (128, 128)]
+    grids = torch.meshgrid(vectors)
+    grid = torch.stack(grids)
+    grid = torch.unsqueeze(grid, 0)
+    grid = grid.type(torch.FloatTensor).cuda()
+    print(grid.shape)
+    grid_x = grid[:, 0, :, :].squeeze().detach().cpu().numpy()
+    grid_y = grid[:, 1, :, :].squeeze().detach().cpu().numpy()
+    flow = F.interpolate(flow, size=(64, 64), mode='bilinear')
+    for b in range(10):
+        fig, ax = plt.subplots()
+
+        plot_grid(grid_x, grid_y, ax=ax, color="lightgrey")
+        # sample_grid[..., 1] = sample_grid[..., 1] * -1
+        new_locs = grid + flow[b].unsqueeze(0)
+        for i in range(2):
+            new_locs[:, i, ...] = 2 * (new_locs[:, i, ...] / (128 - 1) - 0.5)
+        new_locs = new_locs.permute(0, 2, 3, 1)
+        new_locs = new_locs[..., [1, 0]]
+        # Pxx = F.grid_sample(flow[b].unsqueeze(0), torch_grid).transpose(3, 2)
+        # Pxx = F.grid_sample(flow[b].unsqueeze(0)[:, 0:1], sample_grid)
+        # Pyy = F.grid_sample(flow[b].unsqueeze(0)[:, 1:2], sample_grid)
+        # dP0 = torch.stack((Pxx, Pyy), -1).squeeze(0)
+        # Pyy = F.grid_sample(flow[b, 1:2].unsqueeze(0), torch_grid).transpose(3, 2)
+        # dist = torch_grid + dP0.permute([0, 2, 3, 1])
+        # dist = F.grid_sample(sample_grid, new_locs)
+        dist = new_locs
+
+        # sample_grid[..., 1] = sample_grid[..., 1] * -1
+
+        # dist[..., 1] = dist[..., 1] * -1
+        dist = (dist / 2 + 0.5) * 127
+
+        distx = dist.squeeze(0)[:, :, 0]
+        disty = dist.squeeze(0)[:, :, 1]
+        distx = distx.detach().cpu().numpy()
+        disty = disty.detach().cpu().numpy()
+
+
+        # plt.figure()
+        # plt.imshow(image[0].squeeze(0).detach().cpu().numpy())
+        # plt.figure()
+        # displace_mask = torch.zeros_like(mask[b, :, :, :])
+        # mask[b, 1, :, :][mask[b, 0, :, :] > 0.5] = 0
+        # displace_mask[0, :, :][mask[b, 0, :, :] > 0.5] = 1
+        # displace_mask[1, :, :][mask[b, 1, :, :] > 0.5] = 1
+        # displace_mask[2, :, :][mask[b, 2, :, :] > 0.5] = 1
+        # displace_mask[0, :, :][(mask[b, 0, :, :] < 0.5) & (mask[b, 1, :, :] < 0.5) & (mask[b, 2, :, :] < 0.5)] = 1
+        # displace_mask[1, :, :][(mask[b, 0, :, :] < 0.5) & (mask[b, 1, :, :] < 0.5) & (mask[b, 2, :, :] < 0.5)] = 1
+        # displace_mask[2, :, :][(mask[b, 0, :, :] < 0.5) & (mask[b, 1, :, :] < 0.5) & (mask[b, 2, :, :] < 0.5)] = 1
+
+        displace_mask = torch.zeros_like(mask[b, :, :, :])
+        affine_masks[1][b, 0, :, :][affine_masks[0][b, 0, :, :] >= 0.5] = 0
+        displace_mask[0, :, :][affine_masks[0][b, 0, :, :] >= 0.5] = 1
+        displace_mask[1, :, :][affine_masks[1][b, 0, :, :] >= 0.5] = 1
+        displace_mask[2, :, :][affine_masks[2][b, 0, :, :] >= 0.5] = 1
+        displace_mask[0, :, :][(affine_masks[0][b, 0, :, :] < 0.5) & (affine_masks[1][b, 0, :, :] < 0.5) & (affine_masks[2][b, 0, :, :] < 0.5)] = 1
+        displace_mask[1, :, :][(affine_masks[0][b, 0, :, :] < 0.5) & (affine_masks[1][b, 0, :, :] < 0.5) & (affine_masks[2][b, 0, :, :] < 0.5)] = 1
+        displace_mask[2, :, :][(affine_masks[0][b, 0, :, :] < 0.5) & (affine_masks[1][b, 0, :, :] < 0.5) & (affine_masks[2][b, 0, :, :] < 0.5)] = 1
+
+        displace_mask = displace_mask.permute(1, 2, 0)
+        plt.imshow(displace_mask.detach().cpu().numpy())
+        plot_grid(distx, disty, ax=ax, color="C0")
+
+        # plt.show()
+        fig, ax = plt.subplots()
+
+        plot_grid(grid_x, grid_y, ax=ax, color="lightgrey")
+        displace_mask = torch.zeros_like(mask[b, :, :, :])
+        deformed_masks[1][b, 0, :, :][deformed_masks[0][b, 0, :, :] >= 0.5] = 0
+        displace_mask[0, :, :][deformed_masks[0][b, 0, :, :] >= 0.5] = 1
+        displace_mask[1, :, :][deformed_masks[1][b, 0, :, :] >= 0.5] = 1
+        displace_mask[2, :, :][deformed_masks[2][b, 0, :, :] >= 0.5] = 1
+        displace_mask[0, :, :][(deformed_masks[0][b, 0, :, :] < 0.5) & (deformed_masks[1][b, 0, :, :] < 0.5) & (deformed_masks[2][b, 0, :, :] < 0.5)] = 1
+        displace_mask[1, :, :][(deformed_masks[0][b, 0, :, :] < 0.5) & (deformed_masks[1][b, 0, :, :] < 0.5) & (deformed_masks[2][b, 0, :, :] < 0.5)] = 1
+        displace_mask[2, :, :][(deformed_masks[0][b, 0, :, :] < 0.5) & (deformed_masks[1][b, 0, :, :] < 0.5) & (deformed_masks[2][b, 0, :, :] < 0.5)] = 1
+
+        displace_mask = displace_mask.permute(1, 2, 0)
+        plt.imshow(displace_mask.detach().cpu().numpy())
+        plot_grid(distx, disty, ax=ax, color="C0")
+
+        fig, ax = plt.subplots()
+        plot_grid(grid_x, grid_y, ax=ax, color="lightgrey")
+        plt.imshow(image[b].squeeze(0).detach().cpu().numpy())
+        plot_grid(distx, disty, ax=ax, color="C0")
+        plt.show()
+
 
 
 
@@ -522,9 +632,12 @@ def train_shape_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, 
         g_map = g_map.to(device)
 
         # pred_masks, pred_nodes, disp, bdry, dt = model(image, mask, args.iter)
-        preint_flow, init_mask0, init_mask1, init_mask2, \
+        flow, preint_flow, init_mask0, init_mask1, init_mask2, \
         affine_mask0, affine_mask1, affine_mask2, \
         deform_mask0, deform_mask1, deform_mask2 = model(image, args.iter)
+
+        # plot_2(flow, image, mask, [affine_mask0, affine_mask1, affine_mask2], [deform_mask0, deform_mask1, deform_mask2])
+
         # g_map_lambda = 10
         # loss_gmap = g_map_lambda * F.mse_loss(disp, g_map)
 
@@ -532,8 +645,8 @@ def train_shape_acdr_epoch(model, optimizer, data_loader, epoch, args, summary, 
         loss_ac = 0
         global_step = epoch * len(data_loader) + i
         if epoch > affine_epoch:
-            flow_loss = flow_grad_loss(preint_flow)
-            loss_ac += flow_loss * 10000
+            flow_loss = flow_grad_loss(flow)
+            loss_ac += flow_loss
         m_f1 = []
         m_mse = []
         for mask_idx, affine_mask, init_mask, deform_mask in zip(
@@ -609,11 +722,13 @@ def val_shape_acdr_epoch(model, data_loader, epoch, args, summary, device):
         mask = mask.to(device)
         g_map = g_map.to(device)
 
-        init_mask0, init_mask1, init_mask2, \
+        flow, init_mask0, init_mask1, init_mask2, \
         affine_mask0, affine_mask1, affine_mask2, \
-        deform_mask0, deform_mask1, deform_mask2 = model(image, args.iter)
+        deform_mask0, deform_mask1, deform_mask2 = model(image)
 
-        # plot(disp, image, mask, [affine_mask0, affine_mask1, affine_mask2], [pred_mask0, pred_mask1, pred_mask2])
+        plot_2(flow, image, mask, [affine_mask0, affine_mask1, affine_mask2], [deform_mask0, deform_mask1, deform_mask2])
+
+        # plot(flow, image, mask, [affine_mask0, affine_mask1, affine_mask2], [deform_mask0, deform_mask1, deform_mask2])
 
         for mask_idx, affine_mask, init_mask, deform_mask in zip(
             [0, 1, 2],

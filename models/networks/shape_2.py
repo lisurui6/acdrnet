@@ -7,8 +7,7 @@ from utils.topology import get_circles, get_circles_2, get_circles_3
 import neural_renderer as nr
 from torch.distributions.normal import Normal
 import math
-from models.layer import SpatialTransformer, VecInt
-from rasterizor.rasterize import Rasterize
+from models.layer import SpatialTransformer, VecInt, AffineSpatialTransformer
 
 
 __all__ = ['ShapeDeformCardiacCircleNet']
@@ -17,6 +16,7 @@ kernel_size = 5
 
 
 class ShapeDeformCardiacCircleNet(nn.Module):
+    """No points, just mask after init. then affine and deform"""
     def __init__(self, num_nodes, enc_dim, dec_size, image_size, drop):
         super().__init__()
         self.num_nodes = num_nodes
@@ -114,7 +114,8 @@ class ShapeDeformCardiacCircleNet(nn.Module):
         self.tri0 = None
         self.tri1 = None
         self.tri2 = None
-        self.rasterizor = Rasterize(image_size=self.image_size, anti_aliasing=False)
+        self.affine_transformer = AffineSpatialTransformer(mode="bilinear")
+        self.deform_transformer = SpatialTransformer(size=(image_size, image_size), mode="bilinear")
 
     def forward(self, img, steps=7):
         # x = (B, 1, H, W)
@@ -126,14 +127,13 @@ class ShapeDeformCardiacCircleNet(nn.Module):
 
         nodes0, faces0, nodes1, faces1, nodes2, faces2, self.tri0, self.tri1, self.tri2 = get_circles_3(
             out_par1, out_par2,
-            img.shape[0], self.dec_size, self.num_nodes, img.device, self.tri0, self.tri1, self.tri2,
-            use_pymesh=True
+            img.shape[0], self.dec_size, self.num_nodes, img.device, self.tri0, self.tri1, self.tri2
         )
 
         # plot(nodes0, faces0, nodes1, faces1, nodes2, faces2)
-        init_mask0 = self.rasterize_mask(nodes0, faces0)
-        init_mask1 = self.rasterize_mask(nodes1, faces1)
-        init_mask2 = self.rasterize_mask(nodes2, faces2)
+        init_mask0 = self.render_mask(nodes0, faces0)
+        init_mask1 = self.render_mask(nodes1, faces1)
+        init_mask2 = self.render_mask(nodes2, faces2)
 
         affine_in = torch.cat([x, init_mask0, init_mask1, init_mask2], dim=1).detach()
         out = self.affine_encoder(affine_in)
@@ -143,65 +143,29 @@ class ShapeDeformCardiacCircleNet(nn.Module):
         affine_pars2 = self.affine_end2(affine_pars)
 
         #
-        affine_node0 = similarity_transform_points(nodes0, affine_pars1, affine_pars2)
-        affine_node1 = similarity_transform_points(nodes1, affine_pars1, affine_pars2)
-        affine_node2 = similarity_transform_points(nodes2, affine_pars1, affine_pars2)
-        #
-        affine_mask0 = self.rasterize_mask(affine_node0, faces0)
-        affine_mask1 = self.rasterize_mask(affine_node1, faces1)
-        affine_mask2 = self.rasterize_mask(affine_node2, faces2)
-        #
+        affine_matrix = similarity_matrix(affine_pars1, affine_pars2)
+        affine_theta = affine_matrix[:, :2, :]
+        init_mask = torch.cat([init_mask0, init_mask1, init_mask2], dim=1)
+        affine_mask = self.affine_transformer(init_mask, affine_theta)
 
-        #
-        deform_in = torch.cat([x, affine_mask0, affine_mask1, affine_mask2], dim=1).detach()
+        deform_in = torch.cat([x, affine_mask], dim=1).detach()
         features = self.deform_backbone(deform_in)
         flow = self.flow(self.decoder(features))
         #
         if flow.shape[2:] != img.shape[2:]:
             flow = F.interpolate(flow, size=img.shape[2:], mode='bilinear')
-        flow = flow / img.shape[2]
-        # scale = 1.0 / steps
-        # flow = flow * scale
         preint_flow = flow
         flow = self.integrate(preint_flow)
-        # Sample and move
-        affine_node0[..., 1] = affine_node0[..., 1] * -1
-        Pxx = F.grid_sample(flow[:, 0:1], affine_node0).transpose(3, 2)
-        Pyy = F.grid_sample(flow[:, 1:2], affine_node0).transpose(3, 2)
-        dP0 = torch.cat((Pxx, Pyy), -1)
-        affine_node0 = affine_node0 + dP0
-
-        affine_node1[..., 1] = affine_node1[..., 1] * -1
-        Pxx = F.grid_sample(flow[:, 0:1], affine_node1).transpose(3, 2)
-        Pyy = F.grid_sample(flow[:, 1:2], affine_node1).transpose(3, 2)
-        dP1 = torch.cat((Pxx, Pyy), -1)
-        affine_node1 = affine_node1 + dP1
-
-        affine_node2[..., 1] = affine_node2[..., 1] * -1
-        Pxx2 = F.grid_sample(flow[:, 0:1], affine_node2).transpose(3, 2)
-        Pyy2 = F.grid_sample(flow[:, 1:2], affine_node2).transpose(3, 2)
-        dP2 = torch.cat((Pxx2, Pyy2), -1)
-        affine_node2 = affine_node2 + dP2
-
-        # Render mask
-        affine_node0[..., 1] = affine_node0[..., 1] * -1
-        affine_node1[..., 1] = affine_node1[..., 1] * -1
-        affine_node2[..., 1] = affine_node2[..., 1] * -1
-
-        #
-        # # Render mask
-        deform_mask0 = self.render_mask(affine_node0, faces0)
-        deform_mask1 = self.render_mask(affine_node1, faces1)
-        deform_mask2 = self.render_mask(affine_node2, faces2)
+        deform_mask = self.deform_transformer(affine_mask, flow)
 
         if self.training:
             return flow, preint_flow, init_mask0, init_mask1, init_mask2, \
-                   affine_mask0, affine_mask1, affine_mask2, \
-                   deform_mask0, deform_mask1, deform_mask2
+                   affine_mask[:, 0:1, ...], affine_mask[:, 1:2, ...], affine_mask[:, 2:, ...], \
+                   deform_mask[:, 0:1, ...], deform_mask[:, 1:2, ...], deform_mask[:, 2:, ...]
         else:
             return flow, init_mask0, init_mask1, init_mask2, \
-                   affine_mask0, affine_mask1, affine_mask2, \
-                   deform_mask0, deform_mask1, deform_mask2
+                   affine_mask[:, 0:1, ...], affine_mask[:, 1:2, ...], affine_mask[:, 2:, ...], \
+                   deform_mask[:, 0:1, ...], deform_mask[:, 1:2, ...], deform_mask[:, 2:, ...]
 
     def render_mask(self, nodes, faces):
         z = torch.ones((nodes.shape[0], 1, nodes.shape[2], 1)).to(nodes.device)
@@ -209,12 +173,6 @@ class ShapeDeformCardiacCircleNet(nn.Module):
         P3d = torch.squeeze(P3d, dim=1)
         faces = torch.squeeze(faces, dim=1).to(nodes.device)
         mask = self.renderer(P3d, faces, mode='silhouettes').unsqueeze(1)
-        return mask
-
-    def rasterize_mask(self, nodes, faces):
-        P3d = torch.squeeze(nodes, dim=1)
-        faces = torch.squeeze(faces, dim=1).to(nodes.device)
-        mask = self.rasterizor(P3d, faces).unsqueeze(1)
         return mask
 
 
@@ -239,11 +197,7 @@ def affine_transform_points(points, affine_pars):
     return affine_nodes0
 
 
-def similarity_transform_points(points, affine_pars1, affine_pars2):
-    z = torch.ones((points.shape[0], 1, points.shape[2], 1)).to(points.device)
-    affine_nodes0 = torch.cat((points, z), 3)
-    affine_nodes0 = affine_nodes0.squeeze(1)
-
+def similarity_matrix(affine_pars1, affine_pars2):
     theta = affine_pars1[:, 0] * math.pi
     rotation_matrix = torch.stack([
         torch.stack([torch.cos(theta), -torch.sin(theta), torch.zeros_like(theta)], dim=1),
@@ -268,11 +222,7 @@ def similarity_transform_points(points, affine_pars1, affine_pars2):
     ], dim=2)
 
     affine_matrix = torch.bmm(torch.bmm(rotation_matrix, scaling_matrix), translation_matrix)
-    affine_nodes0 = torch.bmm(affine_nodes0, affine_matrix)
-
-    affine_nodes0 = affine_nodes0.unsqueeze(1)
-    affine_nodes0 = affine_nodes0[:, :, :, :2]
-    return affine_nodes0
+    return affine_matrix
 
 
 class CardiacUNet(torch.nn.Module):
@@ -316,9 +266,7 @@ def plot(nodes0, face0, nodes1, face1, nodes2, face2):
     plt.plot(nodes2[0, 0], nodes2[0, 1], 'go')
     plt.plot(nodes2[-1, 0], nodes2[-1, 1], 'ro')
 
-    plt.plot(nodes2[:, 0], nodes2[:, 1], 'bx')
-    # plt.savefig("nodes2.png")
-    print(nodes2.shape, face2.shape)
+    plt.plot(nodes2[:, 0], nodes2[:, 1], 'bx-')
     for f in range(face2.shape[0]):
         p1 = nodes2[face2[f, 0], :]
         p2 = nodes2[face2[f, 1], :]
@@ -326,8 +274,7 @@ def plot(nodes0, face0, nodes1, face1, nodes2, face2):
         plt.plot([p1[0], p2[0]], [p1[1], p2[1]], 'k-')
         plt.plot([p1[0], p3[0]], [p1[1], p3[1]], 'k-')
         plt.plot([p3[0], p2[0]], [p3[1], p2[1]], 'k-')
-    plt.savefig("nodes2.png")
-    assert 1 == 0
+
     plt.figure()
     plt.imshow(np.zeros((128, 128)))
     plt.plot(nodes0[0, 0], nodes0[0, 1], 'go')
@@ -341,7 +288,7 @@ def plot(nodes0, face0, nodes1, face1, nodes2, face2):
         plt.plot([p1[0], p2[0]], [p1[1], p2[1]], 'k-')
         plt.plot([p1[0], p3[0]], [p1[1], p3[1]], 'k-')
         plt.plot([p3[0], p2[0]], [p3[1], p2[1]], 'k-')
-    plt.savefig("nodes0.png")
+
     plt.figure()
     plt.imshow(np.zeros((128, 128)))
     plt.plot(nodes1[0, 0], nodes1[0, 1], 'go')
@@ -355,8 +302,8 @@ def plot(nodes0, face0, nodes1, face1, nodes2, face2):
         plt.plot([p1[0], p2[0]], [p1[1], p2[1]], 'k-')
         plt.plot([p1[0], p3[0]], [p1[1], p3[1]], 'k-')
         plt.plot([p3[0], p2[0]], [p3[1], p2[1]], 'k-')
-    plt.savefig("nodes1.png")
-    # plt.show()
+
+    plt.show()
 
 
 def elastic_v(nodes):

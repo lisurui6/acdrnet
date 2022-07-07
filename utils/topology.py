@@ -4,6 +4,7 @@ import numpy as np
 from scipy.spatial import Delaunay
 from shapely import geometry
 from matplotlib import pyplot as plt
+# import pymesh
 
 
 def get_circle(batch_size, masks_size, num_points, device):
@@ -164,7 +165,7 @@ def get_circles_2(batch_size, masks_size, num_points, device):
     return vert0, face0, vert1, face1, vert2, face2, cp_index_0, cp_index_1
 
 
-def get_circles_3(par1, par2, batch_size, masks_size, num_points, device, tri0=None, tri1=None, tri2=None):
+def get_circles_3(par1, par2, batch_size, masks_size, num_points, device, tri0=None, tri1=None, tri2=None, use_pymesh=False):
     """
         par1 (B, 2): c0(x, y)
         par2 (B, 5): r1, factor 0 (r0/r1), theta2/theta2_max, d_c2_c0, theta_c2
@@ -285,6 +286,9 @@ def get_circles_3(par1, par2, batch_size, masks_size, num_points, device, tri0=N
     if tri2 is None:
         tri2 = Delaunay(vert2[0].detach().cpu().numpy()).simplices.copy()
         tri2 = triangulate_within(vert2[0].detach().cpu().numpy(), tri2)
+        tri2 = tri2.copy()
+        # vert2 = torch.from_numpy(mesh.vertices).to(device).repeat(batch_size, 1, 1)
+        # print(vert2.shape, torch.max(vert2), torch.min(vert2))
     vert2 = vert2.unsqueeze(1)
     vert2[:, :, :, 1] = -vert2[:, :, :, 1]
     face2 = torch.Tensor(tri2)[None, None, ...].to(device).repeat(batch_size, 1, 1, 1).type(torch.int32)
